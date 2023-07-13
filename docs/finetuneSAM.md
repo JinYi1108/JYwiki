@@ -1,0 +1,431 @@
+#
+
+##  1微调的目标
+Finetune SAM using the **mask decoder**
+ 
+Encoder-Decoder 模型是一类算法的统称。Encoder-Decoder 算是一个通用的框架.  
+
+* Encoder 又称作编码器。它的作用就是「将现实问题转化为数学问题」  
+* Decoder 又称作解码器，他的作用是「求解数学问题，并转化为现实世界的解决方案」  
+
+***
+SAM模型由三部分组成，分别是an image encoder, a prompt encoder and a mask decoder.
+
+## 2why finetune?
+
+对于图片来说，我们神经网络前几层学习到的都是低级的特征，比如，点、线、面，这些低级的特征对于任何图片来说都是可以抽象出来的，所以我们将他作为通用数据，只微调这些低级特征组合起来的高级特征即可，例如，这些点、线、面，组成的是圆还是椭圆，还是正方形。
+
+the information learn to recognise cats (edge detection, counting paws) will be useful for recognising dogs.
+
+## 3选择mask decoder
+
+image encoder结构复杂，有许多参数，而相对来说mask decoder更轻量，更高效
+
+但是不能直接调用**SamPredictor.predict**——
+因为SamPredictor.predict_torch 中的  torch.no_grad() 阻止计算梯度  
+
+* torch.no_grad()是一个上下文管理器，用来禁止梯度的计算，通常用来网络推断中，它可以减少计算内存的使用量。
+
+* 深度学习中， 神经网络的主要任务是在学习时找到最优的参数（权重和偏置），这个最优参数也就是损失函数最小时的参数。但是，一般情况下，损失函数比较复杂，参数也很多，无法确定在哪里取得最小值。所以通过梯度来寻找最小值（或者尽可能小的值）的方法就是梯度法。
+
+
+
+
+## 4关于自定义数据集
+
+* 分割的图像
+* 真值ground truth   
+* 提示prompt
+![](https://prismic-io.s3.amazonaws.com/encord/45ceb52d-ace7-4908-a5a8-e370c53b6209_Image+of+stamp+with+bounding+box.png)
+
+***
+
+在教程中，他们选择了kaggle库中的邮票数据集——  
+
+* 因为它上面的邮戳是SAM可能没有预先训练过，表现难以完美  
+* 此外提供了准确的ground truth masks，能够计算精确的loss  
+* 数据集还提供了包含真值掩码的边界框，可以作为prompt  
+  
+## 5环境搭建
+
+```
+! pip install kaggle &> /dev/null
+! pip install torch torchvision &> /dev/null
+! pip install opencv-python pycocotools matplotlib onnxruntime onnx &> /dev/null
+! pip install git+https://github.com/facebookresearch/segment-anything.git &> /dev/null
+! wget https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth &> /dev/null
+```
+
+这些命令是在Unix/Linux系统上运行的，用于安装各类包，并将输出重定向到/dev/null。在安装各类包时将所有输出丢弃，不在终端上显示或记录。
+
+> 
+> Place your kaggle.json file into the files in the notebook workspace. More info here https://github.com/Kaggle/kaggle-api#api-credentials
+
+
+## 6数据集准备
+
+```
+! mkdir ~/.kaggle
+! mv kaggle.json ~/.kaggle/
+! chmod 600 ~/.kaggle/kaggle.json
+! kaggle datasets download rtatman/stamp-verification-staver-dataset
+! unzip stamp-verification-staver-dataset.zip &> /dev/null
+```
+
+设置Kaggle API，下载数据集
+
+```
+from pathlib import Path
+import numpy as np
+import matplotlib.pyplot as plt
+import cv2
+# Exclude scans with zero or multiple bboxes (of the first 100)
+stamps_to_exclude = {
+    'stampDS-00008',
+    'stampDS-00010',
+    'stampDS-00015',
+    'stampDS-00021',
+    'stampDS-00027',
+    'stampDS-00031',
+    'stampDS-00039',
+    'stampDS-00041',
+    'stampDS-00049',
+    'stampDS-00053',
+    'stampDS-00059',
+    'stampDS-00069',
+    'stampDS-00073',
+    'stampDS-00080',
+    'stampDS-00090',
+    'stampDS-00098',
+    'stampDS-00100'
+}.union({
+    'stampDS-00012',
+    'stampDS-00013',
+    'stampDS-00014',
+}) # Exclude 3 scans that aren't the type of scan we want to be fine tuning for
+```
+
+前100个数据中，去除邮戳数据为空的，去除不想微调的数据
+
+## 7预处理数据
+
+* 提取作为prompt的边界框坐标
+
+```
+bbox_coords = {}
+for f in sorted(Path('ground-truth-maps/ground-truth-maps/').iterdir())[:100]:
+  k = f.stem[:-3]
+  if k not in stamps_to_exclude:
+    im = cv2.imread(f.as_posix())
+    gray=cv2.cvtColor(im,cv2.COLOR_BGR2GRAY)
+    contours, hierarchy = cv2.findContours(gray,cv2.RETR_LIST,cv2.CHAIN_APPROX_SIMPLE)[-2:]
+    if len(contours) > 1:
+      x,y,w,h = cv2.boundingRect(contours[0])
+      height, width, _ = im.shape
+      bbox_coords[k] = np.array([x, y, x + w, y + h])
+```
+
+> 1 遍历指定目录中的前100个文件。目录路径是ground-truth-maps/ground-truth-maps/  
+2 获取当前文件的文件名，并去掉文件扩展名（后缀），保存在变量k中  
+3 读取当前文件的图像数据  
+4 将彩色图像转换为灰度图像，便于后续的处理  
+5 findContours函数找到灰度图像中的轮廓信息，并将轮廓和层次结构存储在contours和hierarchy变量中    
+
+>* cv2.RETR_LIST检测的轮廓不建立等级关系
+>* cv2.CHAIN_APPROX_SIMPLE压缩水平方向、垂直方向、对角线方向的元素，只保留该方向的终点坐标，例如一个矩形轮廓只需要4个点来保存轮廓信息
+>* ？ cv2.findContours()函数接受的参数为二值图，即黑白的（不是灰度图），所以读取的图像要先转成灰度的，再转成二值图。
+
+> 6 计算第一个轮廓的边界矩形  
+7 获取图像的高度和宽度  
+8 将边界框的坐标信息存储在字典bbox_coords中
+>
+
+遍历一组图像文件，对每个图像提取边界框坐标信息，并将其存储在字典中。
+
+* 获得真值掩码
+
+```
+ground_truth_masks = {}
+for k in bbox_coords.keys():
+  gt_grayscale = cv2.imread(f'ground-truth-pixel/ground-truth-pixel/{k}-px.png', cv2.IMREAD_GRAYSCALE)
+  ground_truth_masks[k] = (gt_grayscale == 0)
+```
+
+> 1 使用imread以灰度图像的形式读取指定路径下的真值掩码图像  
+> 2 将当前边界框的标识作为键，将通过比较真值掩码图像中的像素值是否为0所得到的布尔数组作为值，存储在ground_truth_masks字典中  
+>
+
+根据边界框的标识，读取对应的真值掩码图像，并将掩码转换为布尔数组表示
+
+
+## 8查看image prompt ground truth
+
+```
+def show_mask(mask, ax, random_color=False):
+    if random_color:
+        color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
+    else:
+        color = np.array([30/255, 144/255, 255/255, 0.6])
+    h, w = mask.shape[-2:]
+    mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
+    ax.imshow(mask_image)
+    
+def show_box(box, ax):
+    x0, y0 = box[0], box[1]
+    w, h = box[2] - box[0], box[3] - box[1]
+    ax.add_patch(plt.Rectangle((x0, y0), w, h, edgecolor='green', facecolor=(0,0,0,0), lw=2))    
+```
+
+定义了两个函数 show_mask() 和 show_box()，用于在Matplotlib上显示掩码和边界框
+
+```
+name = 'stampDS-00004'
+image = cv2.imread(f'scans/scans/{name}.png')
+
+plt.figure(figsize=(10,10))
+plt.imshow(image)
+show_box(bbox_coords[name], plt.gca())
+show_mask(ground_truth_masks[name], plt.gca())
+plt.axis('off')
+plt.show()
+```
+
+ground truth mask非常准确，这有利于计算准确的loss。边界框将是一个很好的提示。
+
+## 9微调准备
+
+```
+model_type = 'vit_b'
+checkpoint = 'sam_vit_b_01ec64.pth'
+device = 'cuda:0'
+from segment_anything import SamPredictor, sam_model_registry
+sam_model = sam_model_registry[model_type](checkpoint=checkpoint)
+sam_model.to(device)
+sam_model.train();
+```
+
+* 将输入图像转换为SAM内部函数期望的格式(预处理图像)
+
+```
+from collections import defaultdict
+
+import torch
+
+from segment_anything.utils.transforms import ResizeLongestSide
+
+transformed_data = defaultdict(dict)
+for k in bbox_coords.keys():
+  image = cv2.imread(f'scans/scans/{k}.png')
+  image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)  
+  transform = ResizeLongestSide(sam_model.image_encoder.img_size)
+  input_image = transform.apply_image(image)
+  input_image_torch = torch.as_tensor(input_image, device=device)
+  transformed_image = input_image_torch.permute(2, 0, 1).contiguous()[None, :, :, :]
+  
+  input_image = sam_model.preprocess(transformed_image)
+  original_image_size = image.shape[:2]
+  input_size = tuple(transformed_image.shape[-2:])
+
+  transformed_data[k]['image'] = input_image
+  transformed_data[k]['input_size'] = input_size
+  transformed_data[k]['original_image_size'] = original_image_size
+```
+
+>1 读取图像文件 f'scans/scans/{k}.png' 并存储在变量 image  
+>2 使用 cv2.cvtColor() 将图像从 BGR 格式转换为 RGB 格式  
+3 ResizeLongestSide将图像大小调整为 sam_model.image_encoder.img_size  
+4 使用 torch.as_tensor() 将 input_image 转换为 Torch 张量  
+5 使用 permute() 调整张量的维度顺序，将通道维度放在第一维，并使用 contiguous() 使数据在内存中连续存储，在第一维上添加一个维度，得到形状为 [1, C, H, W] 的张量 transformed_image  
+6 使用 sam_model.preprocess() 对 transformed_image 进行预处理，得到模型的输入  
+7 获取原始图像的尺寸和变换后图像的尺寸，并存储在 original_image_size 和 input_size 中  
+8 将转换后的数据存储在 transformed_data[k] 字典中，包括输入图像 input_image、输入图像尺寸 input_size 和原始图像尺寸 original_image_size
+>
+
+将图像数据进行转换和预处理，并将转换后的数据存储在 transformed_data 字典中
+
+## 10设置优化器
+
+```
+lr = 1e-4
+wd = 0
+optimizer = torch.optim.Adam(sam_model.mask_decoder.parameters(), lr=lr, weight_decay=wd)
+
+loss_fn = torch.nn.MSELoss()
+# loss_fn = torch.nn.BCELoss()
+keys = list(bbox_coords.keys())
+```
+
+> 学习率 （步长）  
+> 权重衰减  
+> 创建一个 Adam 优化器对象。该优化器用于更新 sam_model.mask_decoder 中的参数  
+> 损失函数 创建一个均方误差损失函数对象
+
+## 11运行微调
+
+要做的改进包括批处理和移动图像的计算，并在循环之外提示嵌入，因为我们没有调整模型的这些部分，这将加快训练速度，因为我们不应该在每个时期重新计算嵌入。 有时优化器会迷失在参数空间中，损失函数会崩溃。 从头开始（包括运行“准备微调”下的所有单元格以便再次使用默认权重开始）将解决此问题。
+
+```
+from statistics import mean
+
+from tqdm import tqdm
+from torch.nn.functional import threshold, normalize
+
+num_epochs = 100
+losses = []
+
+for epoch in range(num_epochs):
+  epoch_losses = []
+  # Just train on the first 20 examples
+  for k in keys[:20]:
+    input_image = transformed_data[k]['image'].to(device)
+    input_size = transformed_data[k]['input_size']
+    original_image_size = transformed_data[k]['original_image_size']
+    
+    # No grad here as we don't want to optimise the encoders
+    with torch.no_grad():
+      image_embedding = sam_model.image_encoder(input_image)
+      
+      prompt_box = bbox_coords[k]
+      box = transform.apply_boxes(prompt_box, original_image_size)
+      box_torch = torch.as_tensor(box, dtype=torch.float, device=device)
+      box_torch = box_torch[None, :]
+      
+      sparse_embeddings, dense_embeddings = sam_model.prompt_encoder(
+          points=None,
+          boxes=box_torch,
+          masks=None,
+      )
+    low_res_masks, iou_predictions = sam_model.mask_decoder(
+      image_embeddings=image_embedding,
+      image_pe=sam_model.prompt_encoder.get_dense_pe(),
+      sparse_prompt_embeddings=sparse_embeddings,
+      dense_prompt_embeddings=dense_embeddings,
+      multimask_output=False,
+    )
+
+    upscaled_masks = sam_model.postprocess_masks(low_res_masks, input_size, original_image_size).to(device)
+    binary_mask = normalize(threshold(upscaled_masks, 0.0, 0))
+
+    gt_mask_resized = torch.from_numpy(np.resize(ground_truth_masks[k], (1, 1, ground_truth_masks[k].shape[0], ground_truth_masks[k].shape[1]))).to(device)
+    gt_binary_mask = torch.as_tensor(gt_mask_resized > 0, dtype=torch.float32)
+    
+    loss = loss_fn(binary_mask, gt_binary_mask)
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    epoch_losses.append(loss.item())
+  losses.append(epoch_losses)
+  print(f'EPOCH: {epoch}')
+  print(f'Mean loss: {mean(epoch_losses)}')
+```
+
+>1 num_epochs = 100 设置了总的训练轮数  
+2 创建一个空列表 epoch_losses，用于存储当前轮次中每个样本的损失值  
+3 从 transformed_data 字典中获取输入图像 input_image、输入图像尺寸 input_size 和原始图像尺寸 original_image_size  
+4 使用 sam_model.image_encoder 对输入图像进行编码，得到图像嵌入 image_embedding  
+5 使用 transform.apply_boxes() 将边界框从变换后的图像尺寸还原到原始图像尺寸，将边界框转换为 Torch 张量  
+6 使用 sam_model.prompt_encoder 对稀疏嵌入和密集嵌入进行编码，得到相应的嵌入张量。  
+7 使用 sam_model.mask_decoder 对图像嵌入和嵌入张量进行解码，得到低分辨率的掩模 low_res_masks 和 IOU 预测结果 iou_predictions  
+8 将低分辨率的掩模调整尺寸，并将其二值化为二进制掩模  
+9 从 ground_truth_masks 字典中获取目标二进制掩模 gt_binary_mask  
+10 计算loss，通过将二进制掩模和目标掩模输入损失函数进行计算  
+11 清除优化器的梯度信息。  
+12 进行反向传播计算梯度。  
+13 执行优化器的参数更新。  
+14 将损失值添加到 epoch_losses 列表中
+
+```
+mean_losses = [mean(x) for x in losses]
+mean_losses
+
+plt.plot(list(range(len(mean_losses))), mean_losses)
+plt.title('Mean epoch loss')
+plt.xlabel('Epoch Number')
+plt.ylabel('Loss')
+
+plt.show()
+```
+
+使用前面计算得到的 losses 列表计算了每个训练轮次的平均损失值，并进行了可视化
+
+## 12比较微调前后的模型
+
+```
+sam_model_orig = sam_model_registry[model_type](checkpoint=checkpoint)
+sam_model_orig.to(device);
+
+from segment_anything import sam_model_registry, SamPredictor
+predictor_tuned = SamPredictor(sam_model)
+predictor_original = SamPredictor(sam_model_orig)
+
+k = keys[21]
+image = cv2.imread(f'scans/scans/{k}.png')
+image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+predictor_tuned.set_image(image)
+predictor_original.set_image(image)
+
+input_bbox = np.array(bbox_coords[k])
+
+masks_tuned, _, _ = predictor_tuned.predict(
+    point_coords=None,
+    box=input_bbox,
+    multimask_output=False,
+)
+
+masks_orig, _, _ = predictor_original.predict(
+    point_coords=None,
+    box=input_bbox,
+    multimask_output=False,
+)
+```
+
+> 1 使用调优后的模型的预测器对象对待预测图像进行预测。预测的结果存储在 masks_tuned  
+> 2 使用原始模型的预测器对象对待预测图像进行预测。预测的结果存储在 masks_orig
+
+```
+%matplotlib inline 
+_, axs = plt.subplots(1, 2, figsize=(25, 25))
+
+
+axs[0].imshow(image)
+show_mask(masks_tuned, axs[0])
+show_box(input_bbox, axs[0])
+axs[0].set_title('Mask with Tuned Model', fontsize=26)
+axs[0].axis('off')
+
+
+axs[1].imshow(image)
+show_mask(masks_orig, axs[1])
+show_box(input_bbox, axs[1])
+axs[1].set_title('Mask with Untuned Model', fontsize=26)
+axs[1].axis('off')
+
+plt.show() 
+```
+
+
+
+
+***
+
+
+
+
+
+
+penCV-Python接口中使用cv2.findContours()函数来查找检测物体的轮廓。
+```
+contours, hierarchy = cv2.findContours(image,mode,method)
+```
+image：输入图像  
+mode：轮廓的模式。cv2.RETR_EXTERNAL只检测外轮廓；cv2.RETR_LIST检测的轮廓不建立等级关系；cv2.RETR_CCOMP建立两个等级的轮廓，上一层为外边界，内层为内孔的边界。如果内孔内还有连通物体，则这个物体的边界也在顶层；cv2.RETR_TREE建立一个等级树结构的轮廓。  
+method：轮廓的近似方法。cv2.CHAIN_APPROX_NOME存储所有的轮廓点，相邻的两个点的像素位置差不超过1；cv2.CHAIN_APPROX_SIMPLE压缩水平方向、垂直方向、对角线方向的元素，只保留该方向的终点坐标，例如一个矩形轮廓只需要4个点来保存轮廓信息；cv2.CHAIN_APPROX_TC89_L1，cv2.CV_CHAIN_APPROX_TC89_KCOS  
+contours：返回的轮廓  
+hierarchy：每条轮廓对应的属性
+
+
+
+
+grad在反向传播过程中是累加的(accumulated)，这意味着每一次运行反向传播，梯度都会累加之前的梯度，所以一般在反向传播之前需把梯度清零。
+

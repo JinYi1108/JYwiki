@@ -1,0 +1,7 @@
+site_name: JinYi Docs
+nav:
+    - Home: index.md
+    - Linux: Linux.md
+    - FinetuneSAM: finetuneSAM.md
+theme: 
+  name: 'readthedocs'
