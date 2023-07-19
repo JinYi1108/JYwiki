@@ -8,4 +8,4 @@ theme:
   name: 'readthedocs'
 
 
-site_dir: /home/docs/checkouts/readthedocs.org/user_builds/jywiki/checkouts/latest1
+site_dir: /home/docs/checkouts/readthedocs.org/user_builds/jywiki/checkouts/latest/_readthedocs/output
