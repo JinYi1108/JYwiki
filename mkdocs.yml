@@ -3,5 +3,9 @@ nav:
     - Home: index.md
     - Linux: Linux.md
     - FinetuneSAM: finetuneSAM.md
+    - Note: note.md
 theme: 
   name: 'readthedocs'
+
+
+site_dir: /home/docs/checkouts/readthedocs.org/user_builds/jywiki/checkouts/latest/_readthedocs/output
