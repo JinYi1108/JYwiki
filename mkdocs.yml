@@ -1,9 +1,13 @@
 site_name: JinYi Docs
 nav:
-    - Home: index.md
-    - Linux: Linux.md
-    - FinetuneSAM: finetuneSAM.md
-    - Note: note.md
+    - Welcome to jinyi-wiki: index.md
+    - 深度学习:
+      - FinetuneSAM: finetuneSAM.md
+      - Labelme基础操作（to be continue): labelme.md
+    - 乱七八糟的内容: 
+      - Linux基础(to be continue): Linux.md
+      - Git基础(to be continue): git.md
+    
 theme: 
   name: 'readthedocs'
 
